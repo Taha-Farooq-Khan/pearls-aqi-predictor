@@ -1,0 +1,16 @@
+# Security (NEVER un-comment these)
+.env
+secrets.toml
+
+# Python/Conda
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# IDE settings
+.idea/
+.vscode/
+
+# Data (Don't upload large datasets)
+*.csv
+*.parquet
