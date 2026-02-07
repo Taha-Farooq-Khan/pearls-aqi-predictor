@@ -2,8 +2,8 @@ name: Daily Model Retraining
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # Runs at 00:00 UTC (5:00 AM PKT)
-  workflow_dispatch:      # Allows you to click a button to run it manually
+    - cron: '0 0 * * *'
+  workflow_dispatch:
 
 jobs:
   run_training_pipeline:
@@ -17,9 +17,9 @@ jobs:
         with:
           python-version: '3.9'
 
-      # FIX: Added "hopsworks[python]" here too
+      # FIX: Pin version to 4.2.4 to match Server
       - name: Install Dependencies
-        run: pip install "hopsworks[python]" pandas scikit-learn tensorflow joblib python-dotenv lightgbm catboost numpy
+        run: pip install hopsworks==4.2.4 pyarrow pandas scikit-learn tensorflow joblib python-dotenv lightgbm catboost numpy
 
       - name: Run Training
         env:

@@ -1,7 +1,11 @@
-hopsworks==3.7.0
+hopsworks==4.2.4
 streamlit
 scikit-learn
 pandas
 python-dotenv
 pyarrow
 joblib
+tensorflow
+lightgbm
+catboost
+plotly

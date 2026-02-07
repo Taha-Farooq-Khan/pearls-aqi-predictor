@@ -2,8 +2,8 @@ name: Hourly Data Feeder
 
 on:
   schedule:
-    - cron: '0 * * * *'  # Runs at minute 0 of every hour
-  workflow_dispatch:      # Allows you to click a button to run it manually
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
 jobs:
   run_feature_pipeline:
@@ -17,9 +17,9 @@ jobs:
         with:
           python-version: '3.9'
 
-      # FIX: Added "hopsworks[python]" to install pyarrow automatically
+      # FIX: Pin version to 4.2.4 to match Server
       - name: Install Dependencies
-        run: pip install "hopsworks[python]" pandas requests python-dotenv numpy
+        run: pip install hopsworks==4.2.4 pyarrow pandas requests python-dotenv numpy
 
       - name: Run Pipeline
         env:
