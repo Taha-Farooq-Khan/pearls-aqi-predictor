@@ -1,4 +1,4 @@
-hopsworks==3.7.0
+hopsworks==4.2.4
 streamlit
 scikit-learn
 pandas
