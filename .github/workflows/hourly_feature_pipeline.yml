@@ -17,8 +17,9 @@ jobs:
         with:
           python-version: '3.9'
 
+      # FIX: Added "hopsworks[python]" to install pyarrow automatically
       - name: Install Dependencies
-        run: pip install pandas hopsworks requests python-dotenv numpy
+        run: pip install "hopsworks[python]" pandas requests python-dotenv numpy
 
       - name: Run Pipeline
         env:
