@@ -1,0 +1,26 @@
+name: Daily Model Retraining
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Runs at 00:00 UTC every day
+  workflow_dispatch:      # Allows you to click a button to run it manually
+
+jobs:
+  run_training_pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: pip install pandas hopsworks scikit-learn tensorflow joblib python-dotenv lightgbm catboost numpy
+
+      - name: Run Training
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+        run: python features/3_training_pipeline.py
