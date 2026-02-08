@@ -91,6 +91,10 @@ df['humid_temp_interaction'] = df['humidity'] * df['temp']
 # TIMESTAMPS: Use the BigInt Fix (Crucial!)
 df['timestamp'] = (df['date'].values.astype("int64") // 10**6).astype("int64")
 
+# Filter out rows that are in the future (Open-Meteo gives the whole day)
+current_time = datetime.now()
+df = df[df['date'] <= current_time]
+
 # Drop NaNs (This will drop the first 24 hours of our 3-day window, which is expected)
 df = df.dropna()
 
