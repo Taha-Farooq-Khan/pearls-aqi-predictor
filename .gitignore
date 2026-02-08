@@ -7,3 +7,6 @@ aqi_models/
 __pycache__/
 .cache.sqlite
 .env
+.idea/
+extras/
+reset_hopsworks.py
