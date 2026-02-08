@@ -11,7 +11,7 @@
 ---
 
 ## 🚀 Live Demo
-**[Click here to view the Live App](https://pearls-aqi-predictor.streamlit.app/)**
+**[Click here to view the Live App](https://multan-aqipearls.streamlit.app//)**
 *(Note: If the app is sleeping, click "Wake Up" and wait a moment).*
 
 ---
