@@ -3,16 +3,19 @@ import pandas as pd
 import numpy as np
 import hopsworks
 import joblib
+import shap  # ADDED: For Explainable AI
+import matplotlib.pyplot as plt  # ADDED: For plotting SHAP
 from sklearn.preprocessing import MinMaxScaler
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM, Input, Conv1D, MaxPooling1D, Flatten
-from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error  # ADDED: MAE
 from dotenv import load_dotenv
 from pathlib import Path
 
-# AUTHENTICATION
+
+# 1. AUTHENTICATION & CONNECTION
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 API_KEY = os.getenv('HOPSWORKS_API_KEY')
@@ -21,7 +24,9 @@ print("Connecting to Feature Store...")
 project = hopsworks.login(api_key_value=API_KEY)
 fs = project.get_feature_store()
 
-# FETCH FULL TRAINING DATA
+
+# 2. FETCH & PREPROCESS DATA
+
 print("Downloading FULL dataset from Cloud...")
 aqi_fg = fs.get_feature_group(name="aqi_data_multan", version=1)
 df = aqi_fg.read()
@@ -29,7 +34,6 @@ df = aqi_fg.read()
 # Sort by time to respect the timeline
 df = df.sort_values(by="timestamp")
 
-# PREPROCESSING
 print("Preprocessing...")
 features = ['pm25_lag_1', 'pm25_lag_6', 'pm25_lag_24', 'pm25_rolling_mean_24h',
             'temp', 'humidity', 'wind_speed', 'rain', 'hour_sin', 'hour_cos', 'humid_temp_interaction']
@@ -46,7 +50,6 @@ X_train = scaler_X.fit_transform(df_train[features])
 X_test = scaler_X.transform(df_test[features])  # Use the same scaler logic on test!
 
 # --- FIX 2: Do NOT Scale Target (y) ---
-# We want the model to predict real PM2.5 values (e.g., 150), not 0.5
 y_train = df_train[target].values
 y_test = df_test[target].values
 
@@ -60,7 +63,8 @@ X_test_3d = X_test_2d.reshape((X_test_2d.shape[0], 1, X_test_2d.shape[1]))
 print(f"Training Data: {len(X_train_2d)} rows")
 print(f"Testing Data:  {len(X_test_2d)} rows")
 
-# TRAIN 4 MODELS
+
+# 3. TRAIN MODELS & EVALUATE (Now with MAE)
 results = {}
 model_dir = "aqi_models"
 if not os.path.exists(model_dir):
@@ -72,9 +76,10 @@ lgbm = LGBMRegressor(n_estimators=300, learning_rate=0.05, random_state=42, verb
 lgbm.fit(X_train_2d, y_train)
 preds_lgbm = lgbm.predict(X_test_2d)
 rmse_lgbm = np.sqrt(mean_squared_error(y_test, preds_lgbm))
+mae_lgbm = mean_absolute_error(y_test, preds_lgbm)
 r2_lgbm = r2_score(y_test, preds_lgbm)
-print(f" RMSE: {rmse_lgbm:.4f}")
-results["LightGBM"] = {"model": lgbm, "rmse": rmse_lgbm, "r2": r2_lgbm, "type": "sklearn"}
+print(f" RMSE: {rmse_lgbm:.4f} | MAE: {mae_lgbm:.4f} | R²: {r2_lgbm:.4f}")
+results["LightGBM"] = {"model": lgbm, "rmse": rmse_lgbm, "mae": mae_lgbm, "r2": r2_lgbm, "type": "sklearn"}
 
 # MODEL 2: CATBOOST
 print("\n Training CatBoost...")
@@ -82,24 +87,26 @@ cat = CatBoostRegressor(n_estimators=300, learning_rate=0.05, verbose=0, random_
 cat.fit(X_train_2d, y_train)
 preds_cat = cat.predict(X_test_2d)
 rmse_cat = np.sqrt(mean_squared_error(y_test, preds_cat))
+mae_cat = mean_absolute_error(y_test, preds_cat)
 r2_cat = r2_score(y_test, preds_cat)
-print(f" RMSE: {rmse_cat:.4f}")
-results["CatBoost"] = {"model": cat, "rmse": rmse_cat, "r2": r2_cat, "type": "sklearn"}
+print(f" RMSE: {rmse_cat:.4f} | MAE: {mae_cat:.4f} | R²: {r2_cat:.4f}")
+results["CatBoost"] = {"model": cat, "rmse": rmse_cat, "mae": mae_cat, "r2": r2_cat, "type": "sklearn"}
 
 # MODEL 3: LSTM
 print("\n Training LSTM...")
 lstm = Sequential([
     Input(shape=(1, len(features))),
     LSTM(64, activation='relu', return_sequences=False),
-    Dense(1)  # Linear output for real values
+    Dense(1)
 ])
 lstm.compile(optimizer='adam', loss='mse')
-lstm.fit(X_train_3d, y_train, epochs=50, batch_size=32, verbose=0)  # Increased epochs slightly
+lstm.fit(X_train_3d, y_train, epochs=50, batch_size=32, verbose=0)
 preds_lstm = lstm.predict(X_test_3d, verbose=0)
 rmse_lstm = np.sqrt(mean_squared_error(y_test, preds_lstm))
+mae_lstm = mean_absolute_error(y_test, preds_lstm)
 r2_lstm = r2_score(y_test, preds_lstm)
-print(f" RMSE: {rmse_lstm:.4f}")
-results["LSTM"] = {"model": lstm, "rmse": rmse_lstm, "r2": r2_lstm, "type": "keras"}
+print(f" RMSE: {rmse_lstm:.4f} | MAE: {mae_lstm:.4f} | R²: {r2_lstm:.4f}")
+results["LSTM"] = {"model": lstm, "rmse": rmse_lstm, "mae": mae_lstm, "r2": r2_lstm, "type": "keras"}
 
 # MODEL 4: 1D-CNN
 print("\n Training 1D-CNN...")
@@ -115,19 +122,43 @@ cnn.compile(optimizer='adam', loss='mse')
 cnn.fit(X_train_3d, y_train, epochs=50, batch_size=32, verbose=0)
 preds_cnn = cnn.predict(X_test_3d, verbose=0)
 rmse_cnn = np.sqrt(mean_squared_error(y_test, preds_cnn))
+mae_cnn = mean_absolute_error(y_test, preds_cnn)
 r2_cnn = r2_score(y_test, preds_cnn)
-print(f" RMSE: {rmse_cnn:.4f}")
-results["CNN"] = {"model": cnn, "rmse": rmse_cnn, "r2": r2_cnn, "type": "keras"}
+print(f" RMSE: {rmse_cnn:.4f} | MAE: {mae_cnn:.4f} | R²: {r2_cnn:.4f}")
+results["CNN"] = {"model": cnn, "rmse": rmse_cnn, "mae": mae_cnn, "r2": r2_cnn, "type": "keras"}
 
-# 5. CHOOSE WINNER
+
+# 4. CHOOSE WINNER & GENERATE SHAP
 best_model_name = min(results, key=lambda k: results[k]["rmse"])
-print(f"\n 🏆 The Winner is: {best_model_name} (RMSE: {results[best_model_name]['rmse']:.4f})")
+print(f"\nThe Winner is: {best_model_name} (RMSE: {results[best_model_name]['rmse']:.4f})")
 
-# 6. UPLOAD TO REGISTRY
+# --- SHAP EXPLAINABILITY (Only for Tree models as requested) ---
+print("\nGenerating SHAP Explainer Plot for the best Tree-based model...")
+# Find the best Tree model (LightGBM or CatBoost) for SHAP
+tree_models = {k: v for k, v in results.items() if v["type"] == "sklearn"}
+best_tree_name = min(tree_models, key=lambda k: tree_models[k]["rmse"])
+best_tree_model = tree_models[best_tree_name]["model"]
+
+# Convert scaled X_test back to DataFrame so SHAP can label the features correctly
+X_test_df = pd.DataFrame(X_test_2d, columns=features)
+X_test_sample = X_test_df.sample(n=min(1000, len(X_test_df)), random_state=42)
+
+explainer = shap.TreeExplainer(best_tree_model)
+shap_values = explainer.shap_values(X_test_sample)
+
+plt.figure(figsize=(10, 6))
+plt.title(f"SHAP Feature Importance: {best_tree_name}", fontsize=14)
+shap.summary_plot(shap_values, X_test_sample, show=False)
+shap_filename = f"shap_summary_{best_tree_name.lower()}.png"
+plt.savefig(shap_filename, dpi=300, bbox_inches='tight')
+plt.close()
+print(f"SHAP plot saved locally as '{shap_filename}'")
+
+# 5. UPLOAD TO HOPSWORKS REGISTRY
 mr = project.get_model_registry()
 
 for name, data in results.items():
-    print(f" Saving {name}...")
+    print(f"Saving {name} to Model Registry...")
 
     # Save Locally
     if data["type"] == "sklearn":
@@ -137,21 +168,19 @@ for name, data in results.items():
         filename = f"{model_dir}/{name.replace(' ', '_').lower()}.keras"
         data["model"].save(filename)
 
-    # Create Metadata
     is_best = (name == best_model_name)
 
-    # Delete old version if exists (Optional cleanup, but keeps registry clean)
-    try:
-        old_model = mr.get_model(f"aqi_{name.replace(' ', '_').lower()}_multan", version=None)
-        # We don't delete, we just let Hopsworks create a new version
-    except:
-        pass
-
+    # ADDED MAE to Hopsworks Metadata Tracking
     hw_model = mr.python.create_model(
         name=f"aqi_{name.replace(' ', '_').lower()}_multan",
-        metrics={"rmse": data["rmse"], "r2": data["r2"], "is_best": 1 if is_best else 0},
+        metrics={
+            "rmse": data["rmse"],
+            "mae": data["mae"],  # <-- MAE logged to Hopsworks!
+            "r2": data["r2"],
+            "is_best": 1 if is_best else 0
+        },
         description=f"{name} Model (Real Values)"
     )
     hw_model.save(filename)
 
-print("Success! Models trained and uploaded.")
+print("Success! Models trained, evaluated, and uploaded.")

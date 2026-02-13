@@ -7,19 +7,20 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pathlib import Path
 
-# AUTHENTICATION
+
+# 1. AUTHENTICATION & CONFIGURATION
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
 API_KEY = os.getenv('HOPSWORKS_API_KEY')
 if not API_KEY:
-    raise ValueError("ERROR! API Key not found! Check your .env file.")
+    raise ValueError("ERROR! API Key not found! Check your .env/secrets file.")
 
-# CONFIGURATION
 LAT = 30.1968
 LON = 71.4782
 
-# CONNECT TO HOPSWORKS
+
+# 2. CONNECT TO HOPSWORKS FEATURE STORE
 print("Connecting to Feature Store...")
 project = hopsworks.login(api_key_value=API_KEY)
 fs = project.get_feature_store()
@@ -27,14 +28,14 @@ fs = project.get_feature_store()
 # Connect to the EXISTING Feature Group
 aqi_fg = fs.get_feature_group(name="aqi_data_multan", version=1)
 
-# FETCH ONLY RECENT DATA
-# We fetch a 3-day window to ensure we can calculate "Lags" (24h) correctly
+
+# 3. FETCH RECENT DATA (3-Day Window for Lags)
 end_date = datetime.now()
 start_date = end_date - timedelta(days=3)
 
 print(f"Fetching fresh data ({start_date.date()} to {end_date.date()})...")
 
-# --- CRITICAL FIX: Use 'api.open-meteo.com' (Forecast) instead of 'archive' for recent data ---
+# A. Weather (Using Forecast API to avoid Archive API delays)
 weather_url = "https://api.open-meteo.com/v1/forecast"
 params_w = {
     "latitude": LAT, "longitude": LON,
@@ -45,13 +46,12 @@ params_w = {
 }
 response_w = requests.get(weather_url, params=params_w)
 
-# Check if API call was successful
 if response_w.status_code != 200:
     raise Exception(f"Weather API Error: {response_w.text}")
 
 df_w = pd.DataFrame(response_w.json()['hourly'])
 
-# B. Pollution (Air Quality API is fine for both history and forecast)
+# B. Pollution
 air_url = "https://air-quality-api.open-meteo.com/v1/air-quality"
 params_a = {
     "latitude": LAT, "longitude": LON,
@@ -67,45 +67,61 @@ if response_a.status_code != 200:
 
 df_a = pd.DataFrame(response_a.json()['hourly'])
 
-# PROCESSING
-# Rename
-df_w.rename(columns={'time': 'date', 'temperature_2m': 'temp',
-                     'relative_humidity_2m': 'humidity', 'wind_speed_10m': 'wind_speed'}, inplace=True)
+# 4. DATA PROCESSING & MERGING
+# Rename columns to match our expected schema
+df_w.rename(columns={
+    'time': 'date',
+    'temperature_2m': 'temp',
+    'relative_humidity_2m': 'humidity',
+    'wind_speed_10m': 'wind_speed'
+}, inplace=True)
+
 df_a.rename(columns={'time': 'date', 'pm2_5': 'pm25'}, inplace=True)
 
-# Merge
+# Merge datasets on the date column
 df_w['date'] = pd.to_datetime(df_w['date'])
 df_a['date'] = pd.to_datetime(df_a['date'])
 df = pd.merge(df_w, df_a, on='date')
 
-# Engineer Features
+
+# 5. FEATURE ENGINEERING
+# Cumulative Lags
 df['pm25_lag_1'] = df['pm25'].shift(1)
 df['pm25_lag_6'] = df['pm25'].shift(6)
 df['pm25_lag_24'] = df['pm25'].shift(24)
+
+# Rolling Trends
 df['pm25_rolling_mean_24h'] = df['pm25'].rolling(window=24).mean()
 df['pm25_rolling_std_24h'] = df['pm25'].rolling(window=24).std()
+
+# Cyclical Time
 df['hour_sin'] = np.sin(2 * np.pi * df['date'].dt.hour / 24)
 df['hour_cos'] = np.cos(2 * np.pi * df['date'].dt.hour / 24)
+
+# Interactions
 df['humid_temp_interaction'] = df['humidity'] * df['temp']
 
-# TIMESTAMPS: Use the BigInt Fix (Crucial!)
-df['timestamp'] = (df['date'].values.astype("int64") // 10**6).astype("int64")
+# Hopsworks BigInt Timestamp Requirement
+df['timestamp'] = (df['date'].values.astype("int64") // 10 ** 6).astype("int64")
 
-# Filter out rows that are in the future (Open-Meteo gives the whole day)
+
+# 6. DATA CLEANING & UPLOAD
+# Filter out future dates provided by the daily forecast
 current_time = datetime.now()
 df = df[df['date'] <= current_time]
 
-# Drop NaNs (This will drop the first 24 hours of our 3-day window, which is expected)
+# Drop NaNs (Drops the first 24h of our 3-day window due to lag_24)
 df = df.dropna()
 
 print(f"New Data Processed: {len(df)} rows.")
 
 if len(df) > 0:
-    # UPLOAD
     print("Pushing to Cloud...")
-    # Hopsworks automatically handles duplicates using the Primary Key (timestamp)
-    # It will update existing rows and insert new ones.
-    aqi_fg.insert(df)
-    print("Success! The Feature Store is updated.")
+
+    # insert() updates existing rows and inserts new ones using the 'timestamp' primary key.
+    # wait=False prevents GitHub Action timeout errors by executing asynchronously.
+    aqi_fg.insert(df, wait=False)
+
+    print("Success! The Feature Store is updated (Materialization running in background).")
 else:
-    print("⚠️ No data to upload. Check API responses or Date range.")
+    print("No data to upload. Check API responses or Date range.")
