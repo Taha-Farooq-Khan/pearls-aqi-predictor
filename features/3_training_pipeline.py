@@ -1,186 +1,600 @@
+"""
+AQI Training Pipeline - Model Training & Evaluation
+====================================================
+Fetches raw data, performs feature engineering on the complete dataset,
+splits into train/val/test, trains multiple models, and uploads the best
+model to Hopsworks Model Registry.
+
+Runs: Daily via GitHub Actions
+"""
+
 import os
 import pandas as pd
 import numpy as np
 import hopsworks
 import joblib
-import shap  # ADDED: For Explainable AI
-import matplotlib.pyplot as plt  # ADDED: For plotting SHAP
+import shap
+import matplotlib
+
+matplotlib.use('Agg')  # Non-interactive backend for GitHub Actions
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import MinMaxScaler
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM, Input, Conv1D, MaxPooling1D, Flatten
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error  # ADDED: MAE
+from tensorflow.keras.layers import Dense, LSTM, Input, Dropout, Conv1D, MaxPooling1D, Flatten
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 from dotenv import load_dotenv
 from pathlib import Path
+import logging
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
-# 1. AUTHENTICATION & CONNECTION
-env_path = Path(__file__).parent.parent / '.env'
-load_dotenv(dotenv_path=env_path)
-API_KEY = os.getenv('HOPSWORKS_API_KEY')
+class AQITrainingPipeline:
+    """Complete training pipeline for AQI prediction models"""
 
-print("Connecting to Feature Store...")
-project = hopsworks.login(api_key_value=API_KEY)
-fs = project.get_feature_store()
+    def __init__(self):
+        """Initialize configuration and connections"""
+        # Load environment variables
+        env_path = Path(__file__).parent.parent / '.env'
+        load_dotenv(dotenv_path=env_path)
+
+        self.api_key = os.getenv('HOPSWORKS_API_KEY')
+        if not self.api_key:
+            raise ValueError("ERROR! HOPSWORKS_API_KEY not found in .env file")
+
+        # Feature configuration (matches your Streamlit app)
+        self.feature_names = [
+            'pm25_lag_1', 'pm25_lag_6', 'pm25_lag_24',
+            'pm25_rolling_mean_24h',
+            'temp', 'humidity', 'wind_speed', 'rain',
+            'hour_sin', 'hour_cos',
+            'humid_temp_interaction'
+        ]
+        self.target = 'pm25'
+
+        # Model directory
+        self.model_dir = "aqi_models"
+        if not os.path.exists(self.model_dir):
+            os.makedirs(self.model_dir)
+
+        # Results storage
+        self.results = {}
+        self.scaler_X = None
+
+        # Connect to Hopsworks
+        logger.info("Connecting to Hopsworks Feature Store...")
+        self.project = hopsworks.login(api_key_value=self.api_key)
+        self.fs = self.project.get_feature_store()
+        self.mr = self.project.get_model_registry()
+
+    def fetch_data(self):
+        """Fetch raw data from feature store"""
+        logger.info("Fetching data from Feature Store...")
+
+        try:
+            fg = self.fs.get_feature_group(name="aqi_data_multan", version=1)
+            df = fg.read()
+
+            # Sort by timestamp
+            df = df.sort_values(by="timestamp")
+            df['date'] = pd.to_datetime(df['date'])
+
+            logger.info(f"Data fetched: {len(df)} rows")
+            logger.info(f"Date range: {df['date'].min()} to {df['date'].max()}")
+
+            return df
+
+        except Exception as e:
+            logger.error(f"Failed to fetch data: {e}")
+            raise
+
+    def engineer_features(self, df):
+        """
+        Create all features on the complete dataset
+        This prevents leakage - features are created before splitting
+        """
+        logger.info("Engineering features...")
+
+        # Ensure sorted by time
+        df = df.sort_values('date').reset_index(drop=True)
+
+        # 1. LAG FEATURES (using shift - no future data leakage)
+        df['pm25_lag_1'] = df['pm25'].shift(1)
+        df['pm25_lag_6'] = df['pm25'].shift(6)
+        df['pm25_lag_24'] = df['pm25'].shift(24)
+
+        # 2. ROLLING STATISTICS (shifted to prevent leakage)
+        # CRITICAL: Use shift(1) so the rolling mean only includes past data
+        df['pm25_rolling_mean_24h'] = df['pm25'].shift(1).rolling(window=24, min_periods=1).mean()
+
+        # 3. CYCLICAL TIME FEATURES
+        df['hour_sin'] = np.sin(2 * np.pi * df['date'].dt.hour / 24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['date'].dt.hour / 24)
+
+        # 4. INTERACTION FEATURES
+        df['humid_temp_interaction'] = df['humidity'] * df['temp']
+
+        # 5. Remove rows with NaN (due to lag/rolling calculations)
+        rows_before = len(df)
+        df = df.dropna()
+        rows_after = len(df)
+        logger.info(f"Dropped {rows_before - rows_after} rows with NaN (expected due to lags)")
+
+        logger.info(f"Feature engineering complete: {len(df)} rows, {len(self.feature_names)} features")
+
+        return df
+
+    def split_data(self, df, train_ratio=0.70, val_ratio=0.15):
+        """
+        Split data into train/val/test with no leakage
+
+        Time series split:
+        - Train: 70%
+        - Validation: 15% (for model selection & hyperparameter tuning)
+        - Test: 15% (for final evaluation only)
+        """
+        logger.info("Splitting data into train/val/test...")
+
+        n = len(df)
+        train_size = int(n * train_ratio)
+        val_size = int(n * (train_ratio + val_ratio))
+
+        df_train = df.iloc[:train_size].copy()
+        df_val = df.iloc[train_size:val_size].copy()
+        df_test = df.iloc[val_size:].copy()
+
+        logger.info(f"Train set: {len(df_train)} rows ({df_train['date'].min()} to {df_train['date'].max()})")
+        logger.info(f"Val set:   {len(df_val)} rows ({df_val['date'].min()} to {df_val['date'].max()})")
+        logger.info(f"Test set:  {len(df_test)} rows ({df_test['date'].min()} to {df_test['date'].max()})")
+
+        return df_train, df_val, df_test
+
+    def scale_features(self, df_train, df_val, df_test):
+        """
+        Scale features using MinMaxScaler
+        Fit on train, transform on val/test
+        """
+        logger.info("Scaling features...")
+
+        # Fit scaler on training data only
+        self.scaler_X = MinMaxScaler()
+        X_train = self.scaler_X.fit_transform(df_train[self.feature_names])
+
+        # Transform validation and test data using the same scaler
+        X_val = self.scaler_X.transform(df_val[self.feature_names])
+        X_test = self.scaler_X.transform(df_test[self.feature_names])
+
+        # Target values (NOT scaled)
+        y_train = df_train[self.target].values
+        y_val = df_val[self.target].values
+        y_test = df_test[self.target].values
+
+        logger.info("Scaling complete")
+
+        return X_train, X_val, X_test, y_train, y_val, y_test
+
+    def evaluate_model(self, y_true, y_pred):
+        """Calculate comprehensive metrics"""
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mae = mean_absolute_error(y_true, y_pred)
+        r2 = r2_score(y_true, y_pred)
+
+        return {'rmse': rmse, 'mae': mae, 'r2': r2}
+
+    def train_lightgbm(self, X_train, y_train, X_val, y_val):
+        """Train LightGBM model"""
+        logger.info("Training LightGBM...")
+
+        model = LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=7,
+            num_leaves=31,
+            random_state=42,
+            verbose=-1
+        )
+
+        model.fit(X_train, y_train)
+
+        # Predictions
+        train_pred = model.predict(X_train)
+        val_pred = model.predict(X_val)
+
+        # Metrics
+        train_metrics = self.evaluate_model(y_train, train_pred)
+        val_metrics = self.evaluate_model(y_val, val_pred)
+
+        logger.info(
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+        logger.info(
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+
+        return model, train_metrics, val_metrics
+
+    def train_catboost(self, X_train, y_train, X_val, y_val):
+        """Train CatBoost model"""
+        logger.info("Training CatBoost...")
+
+        model = CatBoostRegressor(
+            iterations=300,
+            learning_rate=0.05,
+            depth=7,
+            random_seed=42,
+            verbose=0
+        )
+
+        model.fit(X_train, y_train, eval_set=(X_val, y_val), verbose=False)
+
+        # Predictions
+        train_pred = model.predict(X_train)
+        val_pred = model.predict(X_val)
+
+        # Metrics
+        train_metrics = self.evaluate_model(y_train, train_pred)
+        val_metrics = self.evaluate_model(y_val, val_pred)
+
+        logger.info(
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+        logger.info(
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+
+        return model, train_metrics, val_metrics
+
+    def train_lstm(self, X_train, y_train, X_val, y_val):
+        """Train LSTM model"""
+        logger.info("Training LSTM...")
+
+        # Reshape for LSTM: (samples, timesteps=1, features)
+        X_train_3d = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
+        X_val_3d = X_val.reshape((X_val.shape[0], 1, X_val.shape[1]))
+
+        model = Sequential([
+            Input(shape=(1, len(self.feature_names))),
+            LSTM(64, activation='relu', return_sequences=False),
+            Dropout(0.2),
+            Dense(32, activation='relu'),
+            Dense(1)
+        ])
+
+        model.compile(optimizer='adam', loss='mse')
+
+        # Callbacks
+        early_stop = EarlyStopping(
+            monitor='val_loss',
+            patience=15,
+            restore_best_weights=True,
+            verbose=0
+        )
+
+        # Train
+        model.fit(
+            X_train_3d, y_train,
+            validation_data=(X_val_3d, y_val),
+            epochs=50,
+            batch_size=32,
+            callbacks=[early_stop],
+            verbose=0
+        )
+
+        # Predictions
+        train_pred = model.predict(X_train_3d, verbose=0).flatten()
+        val_pred = model.predict(X_val_3d, verbose=0).flatten()
+
+        # Metrics
+        train_metrics = self.evaluate_model(y_train, train_pred)
+        val_metrics = self.evaluate_model(y_val, val_pred)
+
+        logger.info(
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+        logger.info(
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+
+        return model, train_metrics, val_metrics
+
+    def train_cnn(self, X_train, y_train, X_val, y_val):
+        """Train 1D-CNN model"""
+        logger.info("Training CNN...")
+
+        # Reshape for CNN: (samples, timesteps=1, features)
+        X_train_3d = X_train.reshape((X_train.shape[0], 1, X_train.shape[1]))
+        X_val_3d = X_val.reshape((X_val.shape[0], 1, X_val.shape[1]))
+
+        model = Sequential([
+            Input(shape=(1, len(self.feature_names))),
+            Conv1D(filters=64, kernel_size=1, activation='relu'),
+            MaxPooling1D(pool_size=1),
+            Flatten(),
+            Dense(50, activation='relu'),
+            Dense(1)
+        ])
+
+        model.compile(optimizer='adam', loss='mse')
+
+        # Train
+        model.fit(
+            X_train_3d, y_train,
+            validation_data=(X_val_3d, y_val),
+            epochs=50,
+            batch_size=32,
+            verbose=0
+        )
+
+        # Predictions
+        train_pred = model.predict(X_train_3d, verbose=0).flatten()
+        val_pred = model.predict(X_val_3d, verbose=0).flatten()
+
+        # Metrics
+        train_metrics = self.evaluate_model(y_train, train_pred)
+        val_metrics = self.evaluate_model(y_val, val_pred)
+
+        logger.info(
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+        logger.info(
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+
+        return model, train_metrics, val_metrics
+
+    def train_all_models(self, X_train, y_train, X_val, y_val):
+        """Train all models and store results"""
+        logger.info("=" * 60)
+        logger.info("TRAINING ALL MODELS")
+        logger.info("=" * 60)
+
+        # Models to train (matches your Streamlit app expectations)
+        models_to_train = [
+            ('lightgbm', self.train_lightgbm),
+            ('catboost', self.train_catboost),
+            ('lstm', self.train_lstm),
+            ('cnn', self.train_cnn)
+        ]
+
+        for name, train_func in models_to_train:
+            try:
+                model, train_metrics, val_metrics = train_func(X_train, y_train, X_val, y_val)
+
+                self.results[name] = {
+                    'model': model,
+                    'train_metrics': train_metrics,
+                    'val_metrics': val_metrics,
+                    'model_type': 'tree' if name in ['lightgbm', 'catboost'] else 'deep_learning'
+                }
+
+            except Exception as e:
+                logger.error(f"Failed to train {name}: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+
+        logger.info("\n" + "=" * 60)
+        logger.info("MODEL TRAINING COMPLETE")
+        logger.info("=" * 60)
+
+    def select_best_model(self):
+        """Select best model based on validation RMSE"""
+        logger.info("Selecting best model based on validation RMSE...")
+
+        best_model_name = min(
+            self.results.keys(),
+            key=lambda k: self.results[k]['val_metrics']['rmse']
+        )
+
+        logger.info(f"\n🏆 WINNER: {best_model_name.upper()}")
+        logger.info(f"  Validation RMSE: {self.results[best_model_name]['val_metrics']['rmse']:.4f}")
+        logger.info(f"  Validation MAE:  {self.results[best_model_name]['val_metrics']['mae']:.4f}")
+        logger.info(f"  Validation R²:   {self.results[best_model_name]['val_metrics']['r2']:.4f}")
+
+        return best_model_name
+
+    def final_test_evaluation(self, best_model_name, X_test, y_test):
+        """
+        Final evaluation on test set - DONE ONLY ONCE
+        This is the true performance estimate
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("FINAL TEST SET EVALUATION")
+        logger.info("=" * 60)
+
+        model = self.results[best_model_name]['model']
+
+        # Reshape for LSTM/CNN if needed
+        if best_model_name in ['lstm', 'cnn']:
+            X_test_input = X_test.reshape((X_test.shape[0], 1, X_test.shape[1]))
+            test_pred = model.predict(X_test_input, verbose=0).flatten()
+        else:
+            test_pred = model.predict(X_test)
+
+        test_metrics = self.evaluate_model(y_test, test_pred)
+
+        logger.info(f"Model: {best_model_name}")
+        logger.info(f"  Test RMSE: {test_metrics['rmse']:.4f}")
+        logger.info(f"  Test MAE:  {test_metrics['mae']:.4f}")
+        logger.info(f"  Test R²:   {test_metrics['r2']:.4f}")
+
+        # Store test metrics
+        self.results[best_model_name]['test_metrics'] = test_metrics
+
+        return test_metrics
+
+    def generate_shap_explanations(self, best_model_name, X_val):
+        """
+        Generate SHAP explanations on VALIDATION set
+        (Never use test set for explanations)
+        """
+        logger.info("\n" + "=" * 60)
+        logger.info("GENERATING SHAP EXPLANATIONS")
+        logger.info("=" * 60)
+
+        # Only generate SHAP for tree-based models
+        if self.results[best_model_name]['model_type'] != 'tree':
+            logger.info(f"SHAP not available for {best_model_name} (not a tree model)")
+            return None
+
+        model = self.results[best_model_name]['model']
+
+        # Sample from validation set
+        sample_size = min(500, len(X_val))
+        sample_indices = np.random.choice(len(X_val), sample_size, replace=False)
+        X_val_sample = X_val[sample_indices]
+
+        # Create DataFrame for feature names
+        X_val_df = pd.DataFrame(X_val_sample, columns=self.feature_names)
+
+        logger.info(f"Computing SHAP values for {len(X_val_sample)} validation samples...")
+
+        try:
+            # Create explainer
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_val_df)
+
+            # Generate summary plot
+            plt.figure(figsize=(10, 6))
+            shap.summary_plot(shap_values, X_val_df, show=False)
+            plt.title(f"SHAP Feature Importance: {best_model_name.upper()}", fontsize=14, pad=20)
+            plt.tight_layout()
+            summary_path = f"{self.model_dir}/shap_summary_{best_model_name}.png"
+            plt.savefig(summary_path, dpi=150, bbox_inches='tight')
+            plt.close()
+            logger.info(f"  ✓ SHAP plot saved: {summary_path}")
+
+        except Exception as e:
+            logger.warning(f"SHAP generation failed: {e}")
+
+        return True
+
+    def save_model_locally(self, model_name, model):
+        """Save model to disk"""
+        model_type = self.results[model_name]['model_type']
+
+        if model_type == 'tree':
+            filename = f"{self.model_dir}/{model_name}.pkl"
+            joblib.dump(model, filename)
+        else:  # deep_learning
+            filename = f"{self.model_dir}/{model_name}.keras"
+            model.save(filename)
+
+        logger.info(f"  ✓ Model saved: {filename}")
+
+        return filename
+
+    def upload_to_model_registry(self, best_model_name):
+        """Upload all models to Hopsworks Model Registry"""
+        logger.info("\n" + "=" * 60)
+        logger.info("UPLOADING TO MODEL REGISTRY")
+        logger.info("=" * 60)
+
+        for model_name, data in self.results.items():
+            try:
+                logger.info(f"\nUploading {model_name}...")
+
+                # Save locally
+                model_file = self.save_model_locally(model_name, data['model'])
+
+                is_best = (model_name == best_model_name)
+
+                # Prepare metrics (matching your Streamlit app expectations)
+                metrics = {
+                    'rmse': data['val_metrics']['rmse'],  # Use val metrics for comparison
+                    'mae': data['val_metrics']['mae'],
+                    'r2': data['val_metrics']['r2'],
+                    'is_best': 1 if is_best else 0
+                }
+
+                # Add test metrics for best model
+                if is_best and 'test_metrics' in data:
+                    metrics['test_rmse'] = data['test_metrics']['rmse']
+                    metrics['test_mae'] = data['test_metrics']['mae']
+                    metrics['test_r2'] = data['test_metrics']['r2']
+
+                # Create model in registry
+                hw_model = self.mr.python.create_model(
+                    name=f"aqi_{model_name}_multan",
+                    metrics=metrics,
+                    description=f"{model_name.upper()} model for PM2.5 prediction in Multan, Pakistan. "
+                                f"{'✓ BEST MODEL' if is_best else 'Alternative model'}"
+                )
+
+                # Upload model
+                hw_model.save(model_file)
+
+                logger.info(f"  ✓ {model_name} uploaded successfully")
+
+            except Exception as e:
+                logger.error(f"  ✗ Failed to upload {model_name}: {e}")
+
+    def run(self):
+        """Execute the complete training pipeline"""
+        try:
+            logger.info("=" * 60)
+            logger.info("AQI TRAINING PIPELINE STARTED")
+            logger.info("=" * 60)
+
+            # 1. Fetch data
+            df = self.fetch_data()
+
+            # 2. Engineer features on FULL dataset
+            df = self.engineer_features(df)
+
+            # 3. Split data (no leakage - features already created)
+            df_train, df_val, df_test = self.split_data(df)
+
+            # 4. Scale features
+            X_train, X_val, X_test, y_train, y_val, y_test = self.scale_features(
+                df_train, df_val, df_test
+            )
+
+            # 5. Train all models
+            self.train_all_models(X_train, y_train, X_val, y_val)
+
+            # 6. Select best model (based on validation set)
+            best_model_name = self.select_best_model()
+
+            # 7. Final evaluation on test set (ONCE only)
+            test_metrics = self.final_test_evaluation(best_model_name, X_test, y_test)
+
+            # 8. Generate SHAP explanations (on validation set)
+            self.generate_shap_explanations(best_model_name, X_val)
+
+            # 9. Upload to Model Registry
+            self.upload_to_model_registry(best_model_name)
+
+            logger.info("\n" + "=" * 60)
+            logger.info("TRAINING PIPELINE COMPLETED SUCCESSFULLY")
+            logger.info("=" * 60)
+            logger.info(f"\n🎉 Best Model: {best_model_name.upper()}")
+            logger.info(f"   Test RMSE: {test_metrics['rmse']:.4f}")
+            logger.info(f"   Test MAE:  {test_metrics['mae']:.4f}")
+            logger.info(f"   Test R²:   {test_metrics['r2']:.4f}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Pipeline execution failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
 
-# 2. FETCH & PREPROCESS DATA
+def main():
+    """Entry point for the training pipeline"""
+    pipeline = AQITrainingPipeline()
+    success = pipeline.run()
 
-print("Downloading FULL dataset from Cloud...")
-aqi_fg = fs.get_feature_group(name="aqi_data_multan", version=1)
-df = aqi_fg.read()
-
-# Sort by time to respect the timeline
-df = df.sort_values(by="timestamp")
-
-print("Preprocessing...")
-features = ['pm25_lag_1', 'pm25_lag_6', 'pm25_lag_24', 'pm25_rolling_mean_24h',
-            'temp', 'humidity', 'wind_speed', 'rain', 'hour_sin', 'hour_cos', 'humid_temp_interaction']
-target = 'pm25'
-
-# --- FIX 1: Split BEFORE Scaling (Prevents Leakage) ---
-train_size = int(len(df) * 0.9)
-df_train = df.iloc[:train_size].copy()
-df_test = df.iloc[train_size:].copy()
-
-# Scale Inputs (X) only
-scaler_X = MinMaxScaler()
-X_train = scaler_X.fit_transform(df_train[features])
-X_test = scaler_X.transform(df_test[features])  # Use the same scaler logic on test!
-
-# --- FIX 2: Do NOT Scale Target (y) ---
-y_train = df_train[target].values
-y_test = df_test[target].values
-
-# A. Data for ML Models (2D)
-X_train_2d, X_test_2d = X_train, X_test
-
-# B. Data for Deep Learning (3D: Rows x 1 Step x Columns)
-X_train_3d = X_train_2d.reshape((X_train_2d.shape[0], 1, X_train_2d.shape[1]))
-X_test_3d = X_test_2d.reshape((X_test_2d.shape[0], 1, X_test_2d.shape[1]))
-
-print(f"Training Data: {len(X_train_2d)} rows")
-print(f"Testing Data:  {len(X_test_2d)} rows")
+    if not success:
+        logger.error("=" * 60)
+        logger.error("PIPELINE FAILED")
+        logger.error("=" * 60)
+        exit(1)
 
 
-# 3. TRAIN MODELS & EVALUATE (Now with MAE)
-results = {}
-model_dir = "aqi_models"
-if not os.path.exists(model_dir):
-    os.mkdir(model_dir)
-
-# MODEL 1: LIGHTGBM
-print("\n Training LightGBM...")
-lgbm = LGBMRegressor(n_estimators=300, learning_rate=0.05, random_state=42, verbose=-1)
-lgbm.fit(X_train_2d, y_train)
-preds_lgbm = lgbm.predict(X_test_2d)
-rmse_lgbm = np.sqrt(mean_squared_error(y_test, preds_lgbm))
-mae_lgbm = mean_absolute_error(y_test, preds_lgbm)
-r2_lgbm = r2_score(y_test, preds_lgbm)
-print(f" RMSE: {rmse_lgbm:.4f} | MAE: {mae_lgbm:.4f} | R²: {r2_lgbm:.4f}")
-results["LightGBM"] = {"model": lgbm, "rmse": rmse_lgbm, "mae": mae_lgbm, "r2": r2_lgbm, "type": "sklearn"}
-
-# MODEL 2: CATBOOST
-print("\n Training CatBoost...")
-cat = CatBoostRegressor(n_estimators=300, learning_rate=0.05, verbose=0, random_state=42)
-cat.fit(X_train_2d, y_train)
-preds_cat = cat.predict(X_test_2d)
-rmse_cat = np.sqrt(mean_squared_error(y_test, preds_cat))
-mae_cat = mean_absolute_error(y_test, preds_cat)
-r2_cat = r2_score(y_test, preds_cat)
-print(f" RMSE: {rmse_cat:.4f} | MAE: {mae_cat:.4f} | R²: {r2_cat:.4f}")
-results["CatBoost"] = {"model": cat, "rmse": rmse_cat, "mae": mae_cat, "r2": r2_cat, "type": "sklearn"}
-
-# MODEL 3: LSTM
-print("\n Training LSTM...")
-lstm = Sequential([
-    Input(shape=(1, len(features))),
-    LSTM(64, activation='relu', return_sequences=False),
-    Dense(1)
-])
-lstm.compile(optimizer='adam', loss='mse')
-lstm.fit(X_train_3d, y_train, epochs=50, batch_size=32, verbose=0)
-preds_lstm = lstm.predict(X_test_3d, verbose=0)
-rmse_lstm = np.sqrt(mean_squared_error(y_test, preds_lstm))
-mae_lstm = mean_absolute_error(y_test, preds_lstm)
-r2_lstm = r2_score(y_test, preds_lstm)
-print(f" RMSE: {rmse_lstm:.4f} | MAE: {mae_lstm:.4f} | R²: {r2_lstm:.4f}")
-results["LSTM"] = {"model": lstm, "rmse": rmse_lstm, "mae": mae_lstm, "r2": r2_lstm, "type": "keras"}
-
-# MODEL 4: 1D-CNN
-print("\n Training 1D-CNN...")
-cnn = Sequential([
-    Input(shape=(1, len(features))),
-    Conv1D(filters=64, kernel_size=1, activation='relu'),
-    MaxPooling1D(pool_size=1),
-    Flatten(),
-    Dense(50, activation='relu'),
-    Dense(1)
-])
-cnn.compile(optimizer='adam', loss='mse')
-cnn.fit(X_train_3d, y_train, epochs=50, batch_size=32, verbose=0)
-preds_cnn = cnn.predict(X_test_3d, verbose=0)
-rmse_cnn = np.sqrt(mean_squared_error(y_test, preds_cnn))
-mae_cnn = mean_absolute_error(y_test, preds_cnn)
-r2_cnn = r2_score(y_test, preds_cnn)
-print(f" RMSE: {rmse_cnn:.4f} | MAE: {mae_cnn:.4f} | R²: {r2_cnn:.4f}")
-results["CNN"] = {"model": cnn, "rmse": rmse_cnn, "mae": mae_cnn, "r2": r2_cnn, "type": "keras"}
-
-
-# 4. CHOOSE WINNER & GENERATE SHAP
-best_model_name = min(results, key=lambda k: results[k]["rmse"])
-print(f"\nThe Winner is: {best_model_name} (RMSE: {results[best_model_name]['rmse']:.4f})")
-
-# --- SHAP EXPLAINABILITY (Only for Tree models as requested) ---
-print("\nGenerating SHAP Explainer Plot for the best Tree-based model...")
-# Find the best Tree model (LightGBM or CatBoost) for SHAP
-tree_models = {k: v for k, v in results.items() if v["type"] == "sklearn"}
-best_tree_name = min(tree_models, key=lambda k: tree_models[k]["rmse"])
-best_tree_model = tree_models[best_tree_name]["model"]
-
-# Convert scaled X_test back to DataFrame so SHAP can label the features correctly
-X_test_df = pd.DataFrame(X_test_2d, columns=features)
-X_test_sample = X_test_df.sample(n=min(1000, len(X_test_df)), random_state=42)
-
-explainer = shap.TreeExplainer(best_tree_model)
-shap_values = explainer.shap_values(X_test_sample)
-
-plt.figure(figsize=(10, 6))
-plt.title(f"SHAP Feature Importance: {best_tree_name}", fontsize=14)
-shap.summary_plot(shap_values, X_test_sample, show=False)
-shap_filename = f"shap_summary_{best_tree_name.lower()}.png"
-plt.savefig(shap_filename, dpi=300, bbox_inches='tight')
-plt.close()
-print(f"SHAP plot saved locally as '{shap_filename}'")
-
-# 5. UPLOAD TO HOPSWORKS REGISTRY
-mr = project.get_model_registry()
-
-for name, data in results.items():
-    print(f"Saving {name} to Model Registry...")
-
-    # Save Locally
-    if data["type"] == "sklearn":
-        filename = f"{model_dir}/{name.replace(' ', '_').lower()}.pkl"
-        joblib.dump(data["model"], filename)
-    else:
-        filename = f"{model_dir}/{name.replace(' ', '_').lower()}.keras"
-        data["model"].save(filename)
-
-    is_best = (name == best_model_name)
-
-    # ADDED MAE to Hopsworks Metadata Tracking
-    hw_model = mr.python.create_model(
-        name=f"aqi_{name.replace(' ', '_').lower()}_multan",
-        metrics={
-            "rmse": data["rmse"],
-            "mae": data["mae"],  # <-- MAE logged to Hopsworks!
-            "r2": data["r2"],
-            "is_best": 1 if is_best else 0
-        },
-        description=f"{name} Model (Real Values)"
-    )
-    hw_model.save(filename)
-
-print("Success! Models trained, evaluated, and uploaded.")
+if __name__ == "__main__":
+    main()
