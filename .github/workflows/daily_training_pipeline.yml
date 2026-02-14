@@ -17,11 +17,12 @@ jobs:
         with:
           python-version: '3.9'
 
-      # FIX: Pin version AND use [python] to get pyarrow automatically
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "hopsworks[python]==4.2.4" "numpy<2.0.0" pandas scikit-learn tensorflow joblib python-dotenv lightgbm catboost
+          pip install "hopsworks[python]==4.2.4" "numpy<2.0.0" pandas \
+                      scikit-learn tensorflow joblib python-dotenv \
+                      lightgbm catboost shap matplotlib seaborn
 
       - name: Run Training
         env:
