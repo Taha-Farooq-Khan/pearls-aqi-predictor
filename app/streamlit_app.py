@@ -372,7 +372,8 @@ if run_button:
             st.caption("Live comparison of algorithms tracked by the Hopsworks Model Registry.")
             metrics_df = pd.DataFrame(metrics_display).sort_values(by="RMSE")
             st.dataframe(
-                metrics_df.style.format({"RMSE": "{:.2f}", "R²": "{:.4f}"}),
+                # Add "MAE": "{:.2f}" to the dictionary
+                metrics_df.style.format({"RMSE": "{:.2f}", "MAE": "{:.2f}", "R²": "{:.4f}"}),
                 hide_index=True,
                 use_container_width=True
             )
