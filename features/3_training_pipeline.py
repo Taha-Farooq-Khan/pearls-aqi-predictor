@@ -216,9 +216,9 @@ class AQITrainingPipeline:
         val_metrics = self.evaluate_model(y_val, val_pred)
 
         logger.info(
-            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R2: {train_metrics['r2']:.4f}")
         logger.info(
-            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R2: {val_metrics['r2']:.4f}")
 
         return model, train_metrics, val_metrics
 
@@ -245,9 +245,9 @@ class AQITrainingPipeline:
         val_metrics = self.evaluate_model(y_val, val_pred)
 
         logger.info(
-            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R2: {train_metrics['r2']:.4f}")
         logger.info(
-            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R2: {val_metrics['r2']:.4f}")
 
         return model, train_metrics, val_metrics
 
@@ -296,9 +296,9 @@ class AQITrainingPipeline:
         val_metrics = self.evaluate_model(y_val, val_pred)
 
         logger.info(
-            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R2: {train_metrics['r2']:.4f}")
         logger.info(
-            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R2: {val_metrics['r2']:.4f}")
 
         return model, train_metrics, val_metrics
 
@@ -339,9 +339,9 @@ class AQITrainingPipeline:
         val_metrics = self.evaluate_model(y_val, val_pred)
 
         logger.info(
-            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R²: {train_metrics['r2']:.4f}")
+            f"  Train - RMSE: {train_metrics['rmse']:.4f}, MAE: {train_metrics['mae']:.4f}, R2: {train_metrics['r2']:.4f}")
         logger.info(
-            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R²: {val_metrics['r2']:.4f}")
+            f"  Val   - RMSE: {val_metrics['rmse']:.4f}, MAE: {val_metrics['mae']:.4f}, R2: {val_metrics['r2']:.4f}")
 
         return model, train_metrics, val_metrics
 
@@ -388,10 +388,10 @@ class AQITrainingPipeline:
             key=lambda k: self.results[k]['val_metrics']['rmse']
         )
 
-        logger.info(f"\n🏆 WINNER: {best_model_name.upper()}")
+        logger.info(f"\n[WINNER]: {best_model_name.upper()}")
         logger.info(f"  Validation RMSE: {self.results[best_model_name]['val_metrics']['rmse']:.4f}")
         logger.info(f"  Validation MAE:  {self.results[best_model_name]['val_metrics']['mae']:.4f}")
-        logger.info(f"  Validation R²:   {self.results[best_model_name]['val_metrics']['r2']:.4f}")
+        logger.info(f"  Validation R2:   {self.results[best_model_name]['val_metrics']['r2']:.4f}")
 
         return best_model_name
 
@@ -418,7 +418,7 @@ class AQITrainingPipeline:
         logger.info(f"Model: {best_model_name}")
         logger.info(f"  Test RMSE: {test_metrics['rmse']:.4f}")
         logger.info(f"  Test MAE:  {test_metrics['mae']:.4f}")
-        logger.info(f"  Test R²:   {test_metrics['r2']:.4f}")
+        logger.info(f"  Test R2:   {test_metrics['r2']:.4f}")
 
         # Store test metrics
         self.results[best_model_name]['test_metrics'] = test_metrics
@@ -427,19 +427,33 @@ class AQITrainingPipeline:
 
     def generate_shap_explanations(self, best_model_name, X_val):
         """
-        Generate SHAP explanations on VALIDATION set
-        (Never use test set for explanations)
+        Generate SHAP explanations on VALIDATION set.
+        If the winner is not a tree, fallback to the best tree model for the plot.
         """
         logger.info("\n" + "=" * 60)
         logger.info("GENERATING SHAP EXPLANATIONS")
         logger.info("=" * 60)
 
-        # Only generate SHAP for tree-based models
-        if self.results[best_model_name]['model_type'] != 'tree':
-            logger.info(f"SHAP not available for {best_model_name} (not a tree model)")
-            return None
+        target_model_name = best_model_name
 
-        model = self.results[best_model_name]['model']
+        # CHECK: Is the winner a tree?
+        if self.results[best_model_name]['model_type'] != 'tree':
+            logger.info(f"Winner ({best_model_name}) is Deep Learning. SHAP TreeExplainer cannot explain it.")
+            logger.info("Switching to the best available Tree model for feature importance plotting...")
+
+            # Filter for tree models only
+            tree_models = {k: v for k, v in self.results.items() if v['model_type'] == 'tree'}
+
+            if not tree_models:
+                logger.warning("No tree models found trained! Skipping SHAP.")
+                return False
+
+            # Find the best performing tree model (lowest RMSE)
+            target_model_name = min(tree_models.keys(), key=lambda k: tree_models[k]['val_metrics']['rmse'])
+            logger.info(f"Selected {target_model_name.upper()} for SHAP interpretation.")
+
+        # Get the model object
+        model = self.results[target_model_name]['model']
 
         # Sample from validation set
         sample_size = min(500, len(X_val))
@@ -459,12 +473,15 @@ class AQITrainingPipeline:
             # Generate summary plot
             plt.figure(figsize=(10, 6))
             shap.summary_plot(shap_values, X_val_df, show=False)
-            plt.title(f"SHAP Feature Importance: {best_model_name.upper()}", fontsize=14, pad=20)
+            plt.title(f"SHAP Feature Importance: {target_model_name.upper()}", fontsize=14, pad=20)
             plt.tight_layout()
+
+            # Save with the WINNER'S name so Streamlit finds it,
+            # even though it was generated by the proxy model.
             summary_path = f"{self.model_dir}/shap_summary_{best_model_name}.png"
             plt.savefig(summary_path, dpi=150, bbox_inches='tight')
             plt.close()
-            logger.info(f"  ✓ SHAP plot saved: {summary_path}")
+            logger.info(f"  - SHAP plot saved: {summary_path}")
 
         except Exception as e:
             logger.warning(f"SHAP generation failed: {e}")
@@ -482,7 +499,7 @@ class AQITrainingPipeline:
             filename = f"{self.model_dir}/{model_name}.keras"
             model.save(filename)
 
-        logger.info(f"  ✓ Model saved: {filename}")
+        logger.info(f"  - Model saved: {filename}")
 
         return filename
 
@@ -516,20 +533,21 @@ class AQITrainingPipeline:
                     metrics['test_r2'] = data['test_metrics']['r2']
 
                 # Create model in registry
+                # EMOJIS REMOVED HERE TO PREVENT DB ERRORS
                 hw_model = self.mr.python.create_model(
                     name=f"aqi_{model_name}_multan",
                     metrics=metrics,
                     description=f"{model_name.upper()} model for PM2.5 prediction in Multan, Pakistan. "
-                                f"{'✓ BEST MODEL' if is_best else 'Alternative model'}"
+                                f"{'[BEST MODEL]' if is_best else 'Alternative model'}"
                 )
 
                 # Upload model
                 hw_model.save(model_file)
 
-                logger.info(f"  ✓ {model_name} uploaded successfully")
+                logger.info(f"  - {model_name} uploaded successfully")
 
             except Exception as e:
-                logger.error(f"  ✗ Failed to upload {model_name}: {e}")
+                logger.error(f"  x Failed to upload {model_name}: {e}")
 
     def run(self):
         """Execute the complete training pipeline"""
@@ -570,7 +588,7 @@ class AQITrainingPipeline:
             logger.info("\n" + "=" * 60)
             logger.info("TRAINING PIPELINE COMPLETED SUCCESSFULLY")
             logger.info("=" * 60)
-            logger.info(f"\n🎉 Best Model: {best_model_name.upper()}")
+            logger.info(f"\n Best Model: {best_model_name.upper()}")
             logger.info(f"   Test RMSE: {test_metrics['rmse']:.4f}")
             logger.info(f"   Test MAE:  {test_metrics['mae']:.4f}")
             logger.info(f"   Test R²:   {test_metrics['r2']:.4f}")
